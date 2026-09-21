@@ -7,8 +7,8 @@ endif
 APP_NAME := teldrive
 BUILD_DIR := bin
 FRONTEND_DIR := ui/dist
-FRONTEND_ASSET := https://github.com/tgdrive/teldrive-ui/releases/download/v1/teldrive-ui.zip
-GIT_TAG := $(shell git describe --tags --abbrev=0)
+FRONTEND_ASSET := https://github.com/tgdrive/teldrive-ui/releases/download/latest/teldrive-ui.zip
+GIT_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null || echo dev)
 GIT_COMMIT := $(shell git rev-parse --short HEAD)
 GIT_LINK := $(shell git remote get-url origin)
 MODULE_PATH := $(shell go list -m)
@@ -31,7 +31,7 @@ ifeq ($(OS),Windows_NT)
 	powershell -Command "Remove-Item -Path teldrive-ui.zip -Force"
 else
 	rm -rf $(FRONTEND_DIR)
-	curl -LO $(FRONTEND_ASSET) -o teldrive-ui.zip
+	curl -L "$(FRONTEND_ASSET)" -o teldrive-ui.zip
 	mkdir -p $(FRONTEND_DIR)
 	unzip -d $(FRONTEND_DIR) teldrive-ui.zip
 	rm -rf teldrive-ui.zip
@@ -43,7 +43,7 @@ endif
 
 backend:
 	@echo "Building backend for $(GOOS)/$(GOARCH)..."
-	go build -trimpath -ldflags "-s -w -X $(MODULE_PATH)/internal/config.Version=$(VERSION) -extldflags=-static" -o $(BUILD_DIR)/$(APP_NAME)$(BINARY_EXTENSION)
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X $(MODULE_PATH)/internal/config.Version=$(VERSION) -extldflags=-static" -o $(BUILD_DIR)/$(APP_NAME)$(BINARY_EXTENSION)
 
 build: frontend backend
 	@echo "Building complete."
