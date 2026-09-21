@@ -8,273 +8,306 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/crypt"
-	"github.com/tgdrive/teldrive/internal/kv"
+	"github.com/tgdrive/teldrive/internal/hash"
 	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/pool"
 	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/pkg/mapper"
-	"github.com/tgdrive/teldrive/pkg/schemas"
+	"go.uber.org/zap"
 
-	"github.com/tgdrive/teldrive/pkg/types"
-
-	"github.com/gin-gonic/gin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/pkg/mapper"
 	"github.com/tgdrive/teldrive/pkg/models"
-	"gorm.io/gorm"
 )
 
-const saltLength = 32
+var (
+	saltLength      = 32
+	ErrUploadFailed = errors.New("upload failed")
+)
 
-type UploadService struct {
-	db     *gorm.DB
-	worker *tgc.BotWorker
-	cnf    *config.TGConfig
-	kv     kv.KV
-	cache  cache.Cacher
+func (a *apiService) UploadsDelete(ctx context.Context, params api.UploadsDeleteParams) error {
+	if err := a.db.Where("upload_id = ?", params.ID).Delete(&models.Upload{}).Error; err != nil {
+		return &api.ErrorStatusCode{StatusCode: 500, Response: api.Error{Message: err.Error(), Code: 500}}
+	}
+	return nil
 }
 
-func NewUploadService(db *gorm.DB, cnf *config.Config, worker *tgc.BotWorker, kv kv.KV, cache cache.Cacher) *UploadService {
-	return &UploadService{db: db, worker: worker, cnf: &cnf.TG, kv: kv, cache: cache}
-}
-
-func (us *UploadService) GetUploadFileById(c *gin.Context) (*schemas.UploadOut, *types.AppError) {
-	uploadId := c.Param("id")
-	parts := []schemas.UploadPartOut{}
-	if err := us.db.Model(&models.Upload{}).Order("part_no").Where("upload_id = ?", uploadId).
-		Where("created_at < ?", time.Now().UTC().Add(us.cnf.Uploads.Retention)).
+func (a *apiService) UploadsPartsById(ctx context.Context, params api.UploadsPartsByIdParams) ([]api.UploadPart, error) {
+	parts := []models.Upload{}
+	if err := a.db.Model(&models.Upload{}).Order("part_no").Where("upload_id = ?", params.ID).
+		Where("created_at < ?", time.Now().UTC().Add(a.cnf.TG.Uploads.Retention)).
 		Find(&parts).Error; err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, &apiError{err: err}
 	}
-
-	return &schemas.UploadOut{Parts: parts}, nil
+	return mapper.ToUploadOut(parts), nil
 }
 
-func (us *UploadService) DeleteUploadFile(c *gin.Context) (*schemas.Message, *types.AppError) {
-	uploadId := c.Param("id")
-	if err := us.db.Where("upload_id = ?", uploadId).Delete(&models.Upload{}).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-	return &schemas.Message{Message: "upload deleted"}, nil
-}
-
-func (us *UploadService) GetUploadStats(userId int64, days int) ([]schemas.UploadStats, *types.AppError) {
-	var stats []schemas.UploadStats
-	err := us.db.Raw(`
-    SELECT 
-        dates.upload_date::date AS upload_date,
-        COALESCE(SUM(files.size), 0)::bigint AS total_uploaded
-    FROM 
-        generate_series(CURRENT_DATE - INTERVAL '1 day' * @days, CURRENT_DATE, '1 day') AS dates(upload_date)
-    LEFT JOIN 
-        teldrive.files AS files
-    ON 
-        dates.upload_date = DATE_TRUNC('day', files.created_at)
-    WHERE 
-	    dates.upload_date >= CURRENT_DATE - INTERVAL '1 day' * @days and (files.type='file' or files.type is null) and (files.user_id=@userId or files.user_id is null)
-    GROUP BY 
+func (a *apiService) UploadsStats(ctx context.Context, params api.UploadsStatsParams) ([]api.UploadStats, error) {
+	userId := auth.GetUser(ctx)
+	var stats []api.UploadStats
+	err := a.db.Raw(`
+    SELECT
+    dates.upload_date::date AS upload_date,
+    COALESCE(SUM(files.size), 0)::bigint AS total_uploaded
+    FROM
+        generate_series(
+            (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - INTERVAL '1 day' * @days,
+            (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date,
+            '1 day'
+        ) AS dates(upload_date)
+    LEFT JOIN
+    teldrive.files AS files
+    ON
+        dates.upload_date = DATE_TRUNC('day', files.created_at)::date
+        AND files.type = 'file'
+        AND files.user_id = @userId
+    GROUP BY
         dates.upload_date
-    ORDER BY 
+    ORDER BY
         dates.upload_date
-  `, sql.Named("days", days-1), sql.Named("userId", userId)).Scan(&stats).Error
+  `, sql.Named("days", params.Days-1), sql.Named("userId", userId)).Scan(&stats).Error
 
 	if err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, &apiError{err: err}
 
 	}
-
 	return stats, nil
 }
 
-func (us *UploadService) UploadFile(c *gin.Context) (*schemas.UploadPartOut, *types.AppError) {
-	var (
-		uploadQuery schemas.UploadQuery
-		channelId   int64
-		err         error
-		client      *telegram.Client
-		middlewares []telegram.Middleware
-		token       string
-		index       int
-		channelUser string
-		out         *schemas.UploadPartOut
-	)
-
-	if err := c.ShouldBindQuery(&uploadQuery); err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusBadRequest}
+func (a *apiService) prepareEncryption(params *api.UploadsUploadParams, fileStream io.Reader, fileSize int64, logger *zap.Logger) (io.Reader, int64, string, error) {
+	if !params.Encrypted.Value {
+		return fileStream, fileSize, "", nil
 	}
-
-	if uploadQuery.Encrypted && us.cnf.Uploads.EncryptionKey == "" {
-		return nil, &types.AppError{Error: errors.New("encryption key not found"),
-			Code: http.StatusBadRequest}
-	}
-
-	userId, session := auth.GetUser(c)
-
-	uploadId := c.Param("id")
-
-	fileStream := c.Request.Body
-
-	fileSize := c.Request.ContentLength
-
-	defer fileStream.Close()
-
-	if uploadQuery.ChannelID == 0 {
-		channelId, err = getDefaultChannel(us.db, us.cache, userId)
-		if err != nil {
-			return nil, &types.AppError{Error: err}
-		}
-	} else {
-		channelId = uploadQuery.ChannelID
-	}
-
-	tokens, err := getBotsToken(us.db, us.cache, userId, channelId)
-
+	salt, err := generateRandomSalt()
 	if err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, 0, "", err
+	}
+	cipher, err := crypt.NewCipher(a.cnf.TG.Uploads.EncryptionKey, salt)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	fileSize = crypt.EncryptedSize(fileSize)
+	fileStream, err = cipher.EncryptData(fileStream)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return fileStream, fileSize, salt, nil
+}
+
+func (a *apiService) getUploadClient(ctx context.Context, userId int64) (*telegram.Client, string, int, string, error) {
+	tokens, err := a.channelManager.BotTokens(ctx, userId)
+	if err != nil {
+		return nil, "", 0, "", err
 	}
 
 	if len(tokens) == 0 {
-		client, err = tgc.AuthClient(c, us.cnf, session)
+		client, err := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession)
 		if err != nil {
-			return nil, &types.AppError{Error: err}
+			return nil, "", 0, "", err
 		}
-		channelUser = strconv.FormatInt(userId, 10)
-	} else {
-		us.worker.Set(tokens, channelId)
-		token, index = us.worker.Next(channelId)
-		client, err = tgc.BotClient(c, us.kv, us.cnf, token)
-
-		if err != nil {
-			return nil, &types.AppError{Error: err}
-		}
-
-		channelUser = strings.Split(token, ":")[0]
+		return client, "", 0, strconv.FormatInt(userId, 10), nil
 	}
 
-	middlewares = tgc.Middlewares(us.cnf, us.cnf.Uploads.MaxRetries)
+	token, index, err := a.botSelector.Next(ctx, tgc.BotOpUpload, userId, tokens)
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	client, err := tgc.BotClient(ctx, a.db, a.cache, &a.cnf.TG, token)
+	if err != nil {
+		return nil, "", 0, "", err
+	}
+	return client, token, index, strings.Split(token, ":")[0], nil
+}
 
-	uploadPool := pool.NewPool(client, int64(us.cnf.PoolSize), middlewares...)
+func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, channelId int64, params *api.UploadsUploadParams, fileStream io.Reader, fileSize int64, logger *zap.Logger) (*tg.Message, error) {
+	channel, err := tgc.GetChannelById(ctx, client, channelId)
+	if err != nil {
+		return nil, err
+	}
 
-	defer uploadPool.Close()
+	u := uploader.NewUploader(client).WithThreads(a.cnf.TG.Uploads.Threads).WithPartSize(512 * 1024)
+	upload, err := u.Upload(ctx, uploader.NewUpload(params.PartName, fileStream, fileSize))
+	if err != nil {
+		return nil, err
+	}
 
-	logger := logging.FromContext(c)
+	document := message.UploadedDocument(upload).Filename(params.PartName).ForceFile(true)
+	sender := message.NewSender(client)
+	target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
 
-	logger.Debugw("uploading chunk", "fileName", uploadQuery.FileName,
-		"partName", uploadQuery.PartName,
-		"bot", channelUser, "botNo", index,
-		"chunkNo", uploadQuery.PartNo, "partSize", fileSize)
+	res, err := target.Media(ctx, document)
+	if err != nil {
+		return nil, err
+	}
 
-	err = tgc.RunWithAuth(c, client, token, func(ctx context.Context) error {
+	updates := res.(*tg.Updates)
+	var message *tg.Message
+	for _, update := range updates.Updates {
+		if channelMsg, ok := update.(*tg.UpdateNewChannelMessage); ok {
+			if msg, ok := channelMsg.Message.AsNotEmpty(); ok {
+				if m, ok := msg.(*tg.Message); ok {
+					message = m
+					break
+				}
+			}
+		}
+	}
 
-		channel, err := tgc.GetChannelById(ctx, client.API(), channelId)
+	if message == nil || message.ID == 0 {
+		return nil, fmt.Errorf("upload failed: invalid message ID 0 from telegram")
+	}
+	return message, nil
+}
 
-		if err != nil {
-			return err
+func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadReqWithContentType, params api.UploadsUploadParams) (*api.UploadPart, error) {
+	if params.Encrypted.Value && a.cnf.TG.Uploads.EncryptionKey == "" {
+		return nil, &apiError{err: errors.New("encryption is not enabled"), code: 400}
+	}
+
+	userId := auth.GetUser(ctx)
+	// Create upload component logger with common fields
+	logger := logging.Component("UPLOAD").With(
+		zap.String("file_name", params.FileName),
+		zap.String("part_name", params.PartName),
+		zap.Int("part_no", params.PartNo),
+		zap.Int64("size", params.ContentLength),
+	)
+
+	channelId := params.ChannelId.Value
+	if channelId == 0 {
+		var err error
+		channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+		if err != nil && err != tgc.ErrNoDefaultChannel {
+			return nil, &apiError{err: err}
+		}
+		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
+			newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
+			if err != nil {
+				logger.Error("channel.create.failed", zap.Error(err))
+				return nil, &apiError{err: err}
+			}
+			channelId = newChannelId
+			logger.Debug("channel.created", zap.Int64("new_channel_id", channelId))
 		}
 
-		var salt string
+	} else {
+		channelId = params.ChannelId.Value
+	}
 
-		if uploadQuery.Encrypted {
-			//gen random Salt
-			salt, _ = generateRandomSalt()
-			cipher, _ := crypt.NewCipher(us.cnf.Uploads.EncryptionKey, salt)
-			fileSize = crypt.EncryptedSize(fileSize)
-			fileStream, _ = cipher.EncryptData(fileStream)
-		}
+	client, token, index, channelUser, err := a.getUploadClient(ctx, userId)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	logger.Debug("upload.started", zap.String("bot", channelUser), zap.Int("bot_no", index), zap.Int64("size", params.ContentLength))
+
+	uploadPool := pool.NewPool(client, int64(a.cnf.TG.PoolSize), a.newMiddlewares(ctx, a.cnf.TG.Uploads.MaxRetries)...)
+	defer func() { uploadPool.Close() }()
+
+	var out api.UploadPart
+	// Compute BLAKE3 block hashes on plaintext BEFORE encryption
+	var blockHasher *hash.BlockHasher
+	var reader io.Reader = req.Content.Data
+
+	if params.Hashing.Value {
+		blockHasher = hash.NewBlockHasher()
+		reader = io.TeeReader(req.Content.Data, blockHasher)
+	}
+
+	err = tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
 
 		client := uploadPool.Default(ctx)
 
-		u := uploader.NewUploader(client).WithThreads(us.cnf.Uploads.Threads).WithPartSize(512 * 1024)
+		fileStream, fileSize, salt, err := a.prepareEncryption(&params, reader, params.ContentLength, logger)
+		if err != nil {
+			return err
+		}
 
-		upload, err := u.Upload(ctx, uploader.NewUpload(uploadQuery.PartName, fileStream, fileSize))
+		message, err := a.uploadToTelegram(ctx, client, channelId, &params, fileStream, fileSize, logger)
 
 		if err != nil {
 			return err
 		}
 
-		document := message.UploadedDocument(upload).Filename(uploadQuery.PartName).ForceFile(true)
+		doc, ok := msgDocument(message)
 
-		sender := message.NewSender(client)
-
-		target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID,
-			AccessHash: channel.AccessHash})
-
-		res, err := target.Media(ctx, document)
-
-		if err != nil {
-			return err
+		if !ok || (doc.Size == 0 && doc.Size != fileSize) {
+			return ErrUploadFailed
 		}
 
-		updates := res.(*tg.Updates)
-
-		var message *tg.Message
-
-		for _, update := range updates.Updates {
-			channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
-			if ok {
-				message = channelMsg.Message.(*tg.Message)
-				break
-			}
-		}
-
-		if message.ID == 0 {
-			return fmt.Errorf("upload failed")
+		var blockHashes []byte
+		if blockHasher != nil {
+			blockHashes = blockHasher.Sum()
 		}
 
 		partUpload := &models.Upload{
-			Name:      uploadQuery.PartName,
-			UploadId:  uploadId,
-			PartId:    message.ID,
-			ChannelID: channelId,
-			Size:      fileSize,
-			PartNo:    uploadQuery.PartNo,
-			UserId:    userId,
-			Encrypted: uploadQuery.Encrypted,
-			Salt:      salt,
+			Name:        params.PartName,
+			UploadId:    params.ID,
+			PartId:      message.ID,
+			ChannelId:   channelId,
+			Size:        fileSize,
+			PartNo:      params.PartNo,
+			UserId:      userId,
+			Encrypted:   params.Encrypted.Value,
+			Salt:        salt,
+			BlockHashes: blockHashes,
 		}
 
-		if err := us.db.Create(partUpload).Error; err != nil {
-			if message.ID != 0 {
-				client.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{Channel: channel, ID: []int{message.ID}})
-			}
+		if err := a.db.Create(partUpload).Error; err != nil {
 			return err
 		}
 
-		//verify if the part is uploaded
-		msgs, _ := client.ChannelsGetMessages(ctx,
-			&tg.ChannelsGetMessagesRequest{Channel: channel, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: message.ID}}})
-
-		if msgs != nil && len(msgs.(*tg.MessagesChannelMessages).Messages) == 0 {
-			return errors.New("upload failed")
+		out = api.UploadPart{
+			Name:      partUpload.Name,
+			PartId:    partUpload.PartId,
+			ChannelId: partUpload.ChannelId,
+			PartNo:    partUpload.PartNo,
+			Size:      partUpload.Size,
+			Encrypted: partUpload.Encrypted,
 		}
-
-		out = mapper.ToUploadOut(partUpload)
-
+		out.SetSalt(api.NewOptString(partUpload.Salt))
 		return nil
 	})
 
 	if err != nil {
-		logger.Debugw("upload failed", "fileName", uploadQuery.FileName,
-			"partName", uploadQuery.PartName,
-			"chunkNo", uploadQuery.PartNo)
-		return nil, &types.AppError{Error: err}
+		logger.Error("upload.failed", zap.String("file_name", params.FileName),
+			zap.String("part_name", params.PartName),
+			zap.Int("part_no", params.PartNo), zap.Error(err))
+		return nil, &apiError{err: err}
 	}
-	logger.Debugw("upload finished", "fileName", uploadQuery.FileName,
-		"partName", uploadQuery.PartName,
-		"chunkNo", uploadQuery.PartNo)
-	return out, nil
+	logger.Debug("upload.complete", zap.Int("message_id", out.PartId), zap.Int64("final_size", out.Size), zap.Bool("encrypted", out.Encrypted))
+	return &out, nil
+}
 
+func msgDocument(m tg.MessageClass) (*tg.Document, bool) {
+	res, ok := m.AsNotEmpty()
+	if !ok {
+		return nil, false
+	}
+	msg, ok := res.(*tg.Message)
+	if !ok {
+		return nil, false
+	}
+
+	media, ok := msg.Media.(*tg.MessageMediaDocument)
+	if !ok || media == nil {
+		return nil, false
+	}
+	doc, ok := media.Document.AsNotEmpty()
+	if !ok {
+		return nil, false
+	}
+	return doc, true
 }
 
 func generateRandomSalt() (string, error) {

@@ -2,41 +2,37 @@ package services
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/WinterYukky/gorm-extra-clause-plugin/exclause"
-	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/auth"
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/category"
-	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/database"
+	"github.com/tgdrive/teldrive/internal/events"
+	"github.com/tgdrive/teldrive/internal/hash"
 	"github.com/tgdrive/teldrive/internal/http_range"
-	"github.com/tgdrive/teldrive/internal/kv"
+	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/md5"
 	"github.com/tgdrive/teldrive/internal/reader"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/mapper"
 	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/schemas"
 	"github.com/tgdrive/teldrive/pkg/types"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
-
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -44,579 +40,53 @@ import (
 
 var (
 	ErrorStreamAbandoned = errors.New("stream abandoned")
+	defaultContentType   = "application/octet-stream"
 )
 
-type buffer struct {
-	Buf []byte
+func isUUID(str string) bool {
+	_, err := uuid.Parse(str)
+	return err == nil
 }
 
-func (b *buffer) long() (int64, error) {
-	v, err := b.uint64()
-	if err != nil {
-		return 0, err
-	}
-	return int64(v), nil
-
-}
-func (b *buffer) uint64() (uint64, error) {
-	const size = 8
-	if len(b.Buf) < size {
-		return 0, io.ErrUnexpectedEOF
-	}
-	v := binary.LittleEndian.Uint64(b.Buf)
-	b.Buf = b.Buf[size:]
-	return v, nil
-}
-
-func randInt64() (int64, error) {
-	var buf [8]byte
-	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
-		return 0, err
-	}
-	b := &buffer{Buf: buf[:]}
-	return b.long()
-}
-
-type FileService struct {
-	db        *gorm.DB
-	cnf       *config.Config
-	botWorker *tgc.BotWorker
-	cache     cache.Cacher
-	kv        kv.KV
-	logger    *zap.SugaredLogger
-}
-
-func NewFileService(
-	db *gorm.DB,
-	cnf *config.Config,
-	worker *tgc.StreamWorker,
-	botWorker *tgc.BotWorker,
-	kv kv.KV,
-	cache cache.Cacher,
-	logger *zap.SugaredLogger) *FileService {
-	return &FileService{db: db, cnf: cnf, botWorker: botWorker, cache: cache, kv: kv, logger: logger}
-}
-
-func (fs *FileService) CreateFile(c *gin.Context, userId int64, fileIn *schemas.FileIn) (*schemas.FileOut, *types.AppError) {
-
-	var (
-		fileDB models.File
-		parent *models.File
-		err    error
-	)
-
-	fileIn.Path = strings.TrimSpace(fileIn.Path)
-
-	if fileIn.Path != "" && fileIn.ParentID == "" {
-		parent, err = fs.getFileFromPath(fileIn.Path, userId)
-		if err != nil {
-			return nil, &types.AppError{Error: err, Code: http.StatusNotFound}
-		}
-		fileDB.ParentID = sql.NullString{
-			String: parent.Id,
-			Valid:  true,
-		}
-	} else if fileIn.ParentID != "" {
-		fileDB.ParentID = sql.NullString{
-			String: fileIn.ParentID,
-			Valid:  true,
-		}
-
-	} else {
-		return nil, &types.AppError{Error: fmt.Errorf("parent id or path is required"), Code: http.StatusBadRequest}
-	}
-
-	if fileIn.Type == "folder" {
-		fileDB.MimeType = "drive/folder"
-		fileDB.Parts = nil
-	} else if fileIn.Type == "file" {
-		channelId := fileIn.ChannelID
-		if fileIn.ChannelID == 0 {
-			var err error
-			channelId, err = getDefaultChannel(fs.db, fs.cache, userId)
-			if err != nil {
-				return nil, &types.AppError{Error: err, Code: http.StatusNotFound}
-			}
-		}
-		fileDB.ChannelID = &channelId
-		fileDB.MimeType = fileIn.MimeType
-		fileDB.Category = string(category.GetCategory(fileIn.Name))
-		fileDB.Parts = datatypes.NewJSONSlice(fileIn.Parts)
-		fileDB.Size = &fileIn.Size
-	}
-	fileDB.Name = fileIn.Name
-	fileDB.Type = fileIn.Type
-	fileDB.UserID = userId
-	fileDB.Status = "active"
-	fileDB.Encrypted = fileIn.Encrypted
-
-	if err := fs.db.Create(&fileDB).Error; err != nil {
-		if database.IsKeyConflictErr(err) {
-			return nil, &types.AppError{Error: database.ErrKeyConflict, Code: http.StatusConflict}
-		}
-		return nil, &types.AppError{Error: err}
-	}
-
-	res := mapper.ToFileOut(fileDB)
-
-	return res, nil
-}
-
-func (fs *FileService) UpdateFile(id string, userId int64, update *schemas.FileUpdate) (*schemas.FileOut, *types.AppError) {
-	var (
-		files []models.File
-		chain *gorm.DB
-	)
-
-	updateDb := models.File{
-		Name:      update.Name,
-		UpdatedAt: update.UpdatedAt,
-		Size:      update.Size,
-	}
-
-	if len(update.Parts) > 0 {
-		updateDb.Parts = datatypes.NewJSONSlice(update.Parts)
-	}
-	chain = fs.db.Model(&files).Clauses(clause.Returning{}).Where("id = ?", id).Updates(updateDb)
-
-	if chain.Error != nil {
-		return nil, &types.AppError{Error: chain.Error}
-	}
-	if chain.RowsAffected == 0 {
-		return nil, &types.AppError{Error: database.ErrNotFound, Code: http.StatusNotFound}
-	}
-
-	fs.cache.Delete(fmt.Sprintf("files:%s", id))
-
-	return mapper.ToFileOut(files[0]), nil
-
-}
-
-func (fs *FileService) GetFileByID(id string) (*schemas.FileOutFull, *types.AppError) {
-	var result []schemas.FileOutFull
-	if err := fs.db.Model(&models.File{}).Select("*", "(select get_path_from_file_id as path from teldrive.get_path_from_file_id(id))").
-		Where("id = ?", id).Scan(&result).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-	if len(result) == 0 {
-		return nil, &types.AppError{Error: database.ErrNotFound, Code: http.StatusNotFound}
-	}
-
-	return &result[0], nil
-}
-
-func (fs *FileService) ListFiles(userId int64, fquery *schemas.FileQuery) (*schemas.FileResponse, *types.AppError) {
-
-	query := fs.db.Where("user_id = ?", userId).Where("status = ?", "active")
-
-	if fquery.Op == "list" {
-		if fquery.Path != "" && fquery.ParentID == "" {
-			query.Where("parent_id in (SELECT id FROM teldrive.get_file_from_path(?, ?, ?))", fquery.Path, userId, true)
-		}
-		if fquery.ParentID != "" {
-			query.Where("parent_id = ?", fquery.ParentID)
-		}
-	} else if fquery.Op == "find" {
-		if fquery.DeepSearch && fquery.Query != "" && fquery.Path != "" {
-			query.Where("files.id in (select id  from subdirs)")
-		}
-		if fquery.UpdatedAt != "" {
-			dateFilters := strings.Split(fquery.UpdatedAt, ",")
-			for _, dateFilter := range dateFilters {
-				parts := strings.Split(dateFilter, ":")
-				if len(parts) == 2 {
-					op, date := parts[0], parts[1]
-					t, err := time.Parse(time.DateOnly, date)
-					if err != nil {
-						return nil, &types.AppError{Error: err}
-					}
-					formattedDate := t.Format(time.RFC3339)
-					switch op {
-					case "gte":
-						query.Where("updated_at >= ?", formattedDate)
-					case "lte":
-						query.Where("updated_at <= ?", formattedDate)
-					case "eq":
-						query.Where("updated_at = ?", formattedDate)
-					case "gt":
-						query.Where("updated_at > ?", formattedDate)
-					case "lt":
-						query.Where("updated_at < ?", formattedDate)
-					}
-				}
-			}
-		}
-
-		if fquery.Query != "" {
-			if fquery.SearchType == "text" {
-				query = query.Where("name &@~ lower(regexp_replace(?, '[^[:alnum:]\\s]', ' ', 'g'))", fquery.Query)
-			} else if fquery.SearchType == "regex" {
-				query = query.Where("name &~ ?", fquery.Query)
-			}
-
-		}
-
-		if fquery.Category != "" {
-			categories := strings.Split(fquery.Category, ",")
-			var filterQuery *gorm.DB
-			if categories[0] == "folder" {
-				filterQuery = fs.db.Where("type = ?", categories[0])
-			} else {
-				filterQuery = fs.db.Where("category = ?", categories[0])
-			}
-			if len(categories) > 1 {
-				for _, category := range categories[1:] {
-					if category == "folder" {
-						filterQuery.Or("type = ?", category)
-					} else {
-						filterQuery.Or("category = ?", category)
-					}
-				}
-			}
-			query.Where(filterQuery)
-		}
-
-		if fquery.Name != "" {
-			query.Where("name = ?", fquery.Name)
-		}
-		if fquery.ParentID != "" {
-			query.Where("parent_id = ?", fquery.ParentID)
-		}
-		if fquery.ParentID == "" && fquery.Path != "" && fquery.Query == "" {
-			query.Where("parent_id in (SELECT id FROM teldrive.get_file_from_path(?, ?, ?))", fquery.Path, userId, true)
-		}
-		if fquery.Type != "" {
-			query.Where("type = ?", fquery.Type)
-		}
-
-		if fquery.Shared != nil && *fquery.Shared {
-			query.Where("id in (SELECT file_id FROM teldrive.file_shares where user_id = ?)", userId)
-		}
-	}
-
-	orderField := utils.CamelToSnake(fquery.Sort)
-
-	var op string
-
-	if fquery.Page == 1 {
-		if fquery.Order == "asc" {
-			op = ">="
-		} else {
-			op = "<="
-		}
-	} else {
-		if fquery.Order == "asc" {
-			op = ">"
-		} else {
-			op = "<"
-		}
-
-	}
-
-	var fileQuery *gorm.DB
-
-	if fquery.DeepSearch && fquery.Query != "" && fquery.Path != "" {
-		fileQuery = fs.db.Clauses(exclause.With{Recursive: true, CTEs: []exclause.CTE{{Name: "subdirs",
-			Subquery: exclause.Subquery{DB: fs.db.Model(&models.File{}).Select("id", "parent_id").
-				Where("id in (SELECT id FROM teldrive.get_file_from_path(?, ?, ?))", fquery.Path, userId, true).
-				Clauses(exclause.NewUnion("ALL ?",
-					fs.db.Table("teldrive.files as f").Select("f.id", "f.parent_id").
-						Joins("inner join subdirs ON f.parent_id = subdirs.id")))}}}})
-	}
-
-	if fileQuery == nil {
-		fileQuery = fs.db
-	}
-
-	fileQuery = fileQuery.Clauses(exclause.NewWith("ranked_scores", fs.db.Model(&models.File{}).Select(orderField, "count(*) OVER () as total",
-		fmt.Sprintf("ROW_NUMBER() OVER (ORDER BY %s %s) AS rank", orderField, strings.ToUpper(fquery.Order))).Where(query))).
-		Model(&models.File{}).Select("*", "(select total from ranked_scores limit 1) as total").
-		Where(fmt.Sprintf("%s %s (SELECT %s FROM ranked_scores WHERE rank = ?)", orderField, op, orderField),
-			max((fquery.Page-1)*fquery.Limit, 1)).
-		Where(query).Order(getOrder(fquery)).Limit(fquery.Limit)
-
-	files := []schemas.FileOut{}
-
-	if err := fileQuery.Scan(&files).Error; err != nil {
-		if strings.Contains(err.Error(), "file not found") {
-			return nil, &types.AppError{Error: database.ErrNotFound, Code: http.StatusNotFound}
-		}
-		return nil, &types.AppError{Error: err}
-	}
-
-	count := 0
-
-	if len(files) > 0 {
-		count = files[0].Total
-	}
-
-	for i := range files {
-		files[i].Total = 0
-	}
-
-	res := &schemas.FileResponse{Files: files,
-		Meta: schemas.Meta{Count: count, TotalPages: int(math.Ceil(float64(count) / float64(fquery.Limit))),
-			CurrentPage: fquery.Page}}
-
-	return res, nil
-}
-
-func (fs *FileService) getFileFromPath(path string, userId int64) (*models.File, error) {
-
-	var res []models.File
-
-	if err := fs.db.Raw("select * from teldrive.get_file_from_path(?, ?, ?)", path, userId, true).
-		Scan(&res).Error; err != nil {
-		return nil, err
-
-	}
-	if len(res) == 0 {
-		return nil, database.ErrNotFound
-	}
-	return &res[0], nil
-}
-
-func (fs *FileService) MakeDirectory(userId int64, payload *schemas.MkDir) (*schemas.FileOut, *types.AppError) {
-	var files []models.File
-
-	if err := fs.db.Raw("select * from teldrive.create_directories(?, ?)", userId, payload.Path).
-		Scan(&files).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	file := mapper.ToFileOut(files[0])
-
-	return file, nil
-}
-
-func (fs *FileService) MoveFiles(userId int64, payload *schemas.FileOperation) (*schemas.Message, *types.AppError) {
-
-	if err := fs.db.Exec("select * from teldrive.move_items($1 , $2 , $3)", payload.Files, payload.Destination, userId).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	return &schemas.Message{Message: "files moved"}, nil
-}
-
-func (fs *FileService) DeleteFiles(userId int64, payload *schemas.DeleteOperation) (*schemas.Message, *types.AppError) {
-
-	if payload.Source != "" {
-		if err := fs.db.Exec("call teldrive.delete_folder_recursive($1 , $2)", payload.Source, userId).Error; err != nil {
-			return nil, &types.AppError{Error: err}
-		}
-	} else if payload.Source == "" && len(payload.Files) > 0 {
-		if err := fs.db.Exec("call teldrive.delete_files_bulk($1 , $2)", payload.Files, userId).Error; err != nil {
-			return nil, &types.AppError{Error: err}
-		}
-
-	}
-
-	return &schemas.Message{Message: "files deleted"}, nil
-}
-
-func (fs *FileService) CreateShare(fileId string, userId int64, payload *schemas.FileShareIn) *types.AppError {
-
-	var fileShare models.FileShare
-
-	if payload.Password != "" {
-		bytes, err := bcrypt.GenerateFromPassword([]byte(payload.Password), bcrypt.MinCost)
-		if err != nil {
-			return &types.AppError{Error: err}
-		}
-		fileShare.Password = utils.StringPointer(string(bytes))
-	}
-
-	fileShare.FileID = fileId
-	fileShare.ExpiresAt = payload.ExpiresAt
-	fileShare.UserID = userId
-
-	if err := fs.db.Create(&fileShare).Error; err != nil {
-		return &types.AppError{Error: err}
-	}
-
-	return nil
-}
-
-func (fs *FileService) UpdateShare(fileId string, userId int64, payload *schemas.FileShareIn) *types.AppError {
-
-	var fileShareUpdate models.FileShare
-
-	if payload.Password != "" {
-		bytes, err := bcrypt.GenerateFromPassword([]byte(payload.Password), bcrypt.MinCost)
-		if err != nil {
-			return &types.AppError{Error: err}
-		}
-		fileShareUpdate.Password = utils.StringPointer(string(bytes))
-	}
-
-	fileShareUpdate.ExpiresAt = payload.ExpiresAt
-
-	if err := fs.db.Model(&models.FileShare{}).Where("file_id = ?", fileId).Where("user_id = ?", userId).
-		Updates(fileShareUpdate).Error; err != nil {
-		return &types.AppError{Error: err}
-	}
-
-	return nil
-}
-
-func (fs *FileService) GetShareByFileId(fileId string, userId int64) (*schemas.FileShareOut, *types.AppError) {
-
-	var result []models.FileShare
-
-	if err := fs.db.Model(&models.FileShare{}).Where("file_id = ?", fileId).Where("user_id = ?", userId).
-		Find(&result).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	if len(result) == 0 {
-		return nil, nil
-	}
-
-	res := &schemas.FileShareOut{ID: result[0].ID, ExpiresAt: result[0].ExpiresAt, Protected: result[0].Password != nil}
-
-	return res, nil
-}
-
-func (fs *FileService) DeleteShare(fileId string, userId int64) *types.AppError {
-
-	var deletedShare models.FileShare
-
-	if err := fs.db.Clauses(clause.Returning{}).Where("file_id = ?", fileId).Where("user_id = ?", userId).
-		Delete(&deletedShare).Error; err != nil {
-		return &types.AppError{Error: err}
-	}
-
-	if deletedShare.ID != "" {
-		fs.cache.Delete(fmt.Sprintf("shares:%s", deletedShare.ID))
-	}
-
-	return nil
-}
-
-func (fs *FileService) UpdateParts(c *gin.Context, id string, userId int64, payload *schemas.PartUpdate) (*schemas.Message, *types.AppError) {
-
-	var file models.File
-
-	updatePayload := models.File{
-		UpdatedAt: payload.UpdatedAt,
-		Size:      utils.Int64Pointer(payload.Size),
-	}
-	if payload.ChannelID == 0 {
-		channelId, err := getDefaultChannel(fs.db, fs.cache, userId)
-		if err != nil {
-			return nil, &types.AppError{Error: err, Code: http.StatusNotFound}
-
-		}
-		updatePayload.ChannelID = &channelId
-	} else {
-		updatePayload.ChannelID = &payload.ChannelID
-	}
-
-	if len(payload.Parts) > 0 {
-		updatePayload.Parts = datatypes.NewJSONSlice(payload.Parts)
-	}
-
-	err := fs.db.Transaction(func(tx *gorm.DB) error {
-
-		if err := tx.Where("id = ?", id).First(&file).Error; err != nil {
-			return err
-		}
-
-		if err := tx.Model(models.File{}).Where("id = ?", id).Updates(updatePayload).Error; err != nil {
-			return err
-		}
-
-		if payload.UploadId != "" {
-			if err := tx.Where("upload_id = ?", payload.UploadId).Delete(&models.Upload{}).Error; err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	if len(file.Parts) > 0 && file.ChannelID != nil {
-		_, session := auth.GetUser(c)
-		ids := []int{}
-		for _, part := range file.Parts {
-			ids = append(ids, int(part.ID))
-		}
-		client, _ := tgc.AuthClient(c, &fs.cnf.TG, session)
-		tgc.DeleteMessages(c, client, *file.ChannelID, ids)
-		keys := []string{fmt.Sprintf("files:%s", id), fmt.Sprintf("files:messages:%s:%d", id, userId)}
-		for _, part := range file.Parts {
-			keys = append(keys, fmt.Sprintf("files:location:%d:%s:%d", userId, id, part.ID))
-
-		}
-		fs.cache.Delete(keys...)
-
-	}
-	fs.cache.Delete(fmt.Sprintf("files:%s", id))
-
-	return &schemas.Message{Message: "file updated"}, nil
-}
-
-func (fs *FileService) MoveDirectory(userId int64, payload *schemas.DirMove) (*schemas.Message, *types.AppError) {
-
-	if err := fs.db.Exec("select * from teldrive.move_directory(? , ? , ?)", payload.Source,
-		payload.Destination, userId).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	return &schemas.Message{Message: "directory moved"}, nil
-}
-
-func (fs *FileService) GetCategoryStats(userId int64) ([]schemas.FileCategoryStats, *types.AppError) {
-
-	var stats []schemas.FileCategoryStats
-
-	if err := fs.db.Model(&models.File{}).Select("category", "COUNT(*) as total_files", "coalesce(SUM(size),0) as total_size").
-		Where(&models.File{UserID: userId, Type: "file", Status: "active"}).
+func (a *apiService) FilesCategoryStats(ctx context.Context) ([]api.CategoryStats, error) {
+	userId := auth.GetUser(ctx)
+	var stats []api.CategoryStats
+	if err := a.db.Model(&models.File{}).Select("category", "COUNT(*) as total_files", "coalesce(SUM(size),0) as total_size").
+		Where(&models.File{UserId: userId, Type: "file", Status: "active"}).
 		Order("category ASC").Group("category").Find(&stats).Error; err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, &apiError{err: err}
 	}
 
 	return stats, nil
 }
 
-func (fs *FileService) CopyFile(c *gin.Context) (*schemas.FileOut, *types.AppError) {
+func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params api.FilesCopyParams) (*api.File, error) {
+	userId := auth.GetUser(ctx)
 
-	var payload schemas.Copy
-
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusBadRequest}
-	}
-
-	userId, session := auth.GetUser(c)
-
-	client, _ := tgc.AuthClient(c, &fs.cnf.TG, session)
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
 
 	var res []models.File
 
-	if err := fs.db.Model(&models.File{}).Where("id = ?", payload.ID).Find(&res).Error; err != nil {
-		return nil, &types.AppError{Error: err}
+	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).Find(&res).Error; err != nil {
+		return nil, &apiError{err: err}
+	}
+	if len(res) == 0 {
+		return nil, &apiError{err: errors.New("file not found"), code: 404}
 	}
 
-	file := mapper.ToFileOutFull(res[0])
+	file := res[0]
 
-	newIds := []schemas.Part{}
+	newIds := []api.Part{}
 
-	channelId, err := getDefaultChannel(fs.db, fs.cache, userId)
+	channelId, err := a.channelManager.CurrentChannel(ctx, userId)
 	if err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, &apiError{err: err}
 	}
 
-	err = tgc.RunWithAuth(c, client, "", func(ctx context.Context) error {
-		ids := []int{}
+	err = tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
 
-		for _, part := range file.Parts {
-			ids = append(ids, int(part.ID))
-		}
-		messages, err := tgc.GetMessages(c, client.API(), ids, *file.ChannelID)
+		ids := utils.Map(*file.Parts, func(part api.Part) int { return part.ID })
+		messages, err := tgc.GetMessages(ctx, client.API(), ids, *file.ChannelId)
 
 		if err != nil {
 			return err
@@ -632,14 +102,14 @@ func (fs *FileService) CopyFile(c *gin.Context) (*schemas.FileOut, *types.AppErr
 			media := item.Media.(*tg.MessageMediaDocument)
 			document := media.Document.(*tg.Document)
 
-			id, _ := randInt64()
+			id, _ := client.RandInt64()
 			request := tg.MessagesSendMediaRequest{
 				Silent:   true,
 				Peer:     &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
 				Media:    &tg.InputMediaDocument{ID: document.AsInput()},
 				RandomID: id,
 			}
-			res, err := client.API().MessagesSendMedia(c, &request)
+			res, err := client.API().MessagesSendMedia(ctx, &request)
 
 			if err != nil {
 				return err
@@ -657,131 +127,747 @@ func (fs *FileService) CopyFile(c *gin.Context) (*schemas.FileOut, *types.AppErr
 				}
 
 			}
-			newIds = append(newIds, schemas.Part{ID: int64(msg.ID), Salt: file.Parts[i].Salt})
+			p := api.Part{ID: msg.ID}
+			if (*file.Parts)[i].Salt.Value != "" {
+				p.Salt = (*file.Parts)[i].Salt
+			}
+			newIds = append(newIds, p)
 
 		}
 		return nil
 	})
 
 	if err != nil {
-		return nil, &types.AppError{Error: err}
+		return nil, &apiError{err: err}
 	}
 
-	var destRes []models.File
-
-	if err := fs.db.Raw("select * from teldrive.create_directories(?, ?)", userId, payload.Destination).Scan(&destRes).Error; err != nil {
-		return nil, &types.AppError{Error: err}
+	if len(newIds) != len(*file.Parts) {
+		return nil, &apiError{err: errors.New("failed to copy all file parts")}
 	}
 
-	dest := destRes[0]
+	var parentId string
+	if !isUUID(req.Destination) {
+		var destRes []models.File
+		if err := a.db.Raw("select * from teldrive.create_directories(?, ?)", userId, req.Destination).
+			Scan(&destRes).Error; err != nil {
+			return nil, &apiError{err: err}
+		}
+		parentId = destRes[0].ID
+	} else {
+		parentId = req.Destination
+	}
 
 	dbFile := models.File{}
 
-	dbFile.Name = payload.Name
-	dbFile.Size = &file.Size
+	dbFile.Name = req.NewName.Or(file.Name)
+	dbFile.Size = file.Size
 	dbFile.Type = file.Type
 	dbFile.MimeType = file.MimeType
-	dbFile.Parts = datatypes.NewJSONSlice(newIds)
-	dbFile.UserID = userId
-	dbFile.Status = "active"
-	dbFile.ParentID = sql.NullString{
-		String: dest.Id,
-		Valid:  true,
+	if len(newIds) > 0 {
+		dbFile.Parts = utils.Ptr(datatypes.NewJSONSlice(newIds))
 	}
-	dbFile.ChannelID = &channelId
+	dbFile.UserId = userId
+	dbFile.Status = "active"
+	dbFile.ParentId = utils.Ptr(parentId)
+	dbFile.ChannelId = &channelId
 	dbFile.Encrypted = file.Encrypted
 	dbFile.Category = file.Category
-
-	if err := fs.db.Create(&dbFile).Error; err != nil {
-		return nil, &types.AppError{Error: err}
+	dbFile.Hash = file.Hash // Preserve hash during copy (content is identical)
+	if req.UpdatedAt.IsSet() && !req.UpdatedAt.Value.IsZero() {
+		dbFile.UpdatedAt = utils.Ptr(req.UpdatedAt.Value)
+	} else {
+		dbFile.UpdatedAt = utils.Ptr(time.Now().UTC())
 	}
 
+	if err := a.db.Create(&dbFile).Error; err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	a.events.Record(events.OpCopy, userId, &models.Source{
+		ID:       dbFile.ID,
+		Type:     dbFile.Type,
+		Name:     dbFile.Name,
+		ParentID: parentId,
+	})
 	return mapper.ToFileOut(dbFile), nil
 }
 
-func (fs *FileService) GetFileStream(c *gin.Context, download bool, sharedFile *schemas.FileShareOut) {
+func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.File, error) {
+	userId := auth.GetUser(ctx)
 
-	w := c.Writer
+	var (
+		fileDB    models.File
+		parentID  *string
+		err       error
+		path      string
+		channelId int64
+		uploadId  string
+		uploads   []models.Upload
+	)
 
-	r := c.Request
+	if fileIn.Path.Value == "" && fileIn.ParentId.Value == "" {
+		return nil, &apiError{err: errors.New("parent id or path is required"), code: 409}
+	}
 
-	fileID := c.Param("fileID")
+	if fileIn.Path.Value != "" {
+		path = strings.ReplaceAll(fileIn.Path.Value, "//", "/")
 
+	}
+
+	if path != "" && fileIn.ParentId.Value == "" {
+		parentID, err = resolvePathID(a.db, path, userId)
+		if err != nil {
+			return nil, &apiError{err: err, code: 404}
+		}
+		fileDB.ParentId = parentID
+
+	} else if fileIn.ParentId.Value != "" {
+		fileDB.ParentId = utils.Ptr(fileIn.ParentId.Value)
+	}
+
+	switch fileIn.Type {
+	case api.FileTypeFolder:
+		fileDB.MimeType = "drive/folder"
+		fileDB.Parts = nil
+	case api.FileTypeFile:
+		if fileIn.ChannelId.Value == 0 {
+			channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+			if err != nil {
+				return nil, &apiError{err: err}
+			}
+		} else {
+			channelId = fileIn.ChannelId.Value
+		}
+		fileDB.ChannelId = &channelId
+		fileDB.MimeType = fileIn.MimeType.Value
+		fileDB.Category = utils.Ptr(string(category.GetCategory(fileIn.Name)))
+
+		// Handle parts - either from direct input or fetch by uploadId
+		var parts []api.Part
+		if len(fileIn.Parts) > 0 {
+			parts = fileIn.Parts
+		} else if fileIn.UploadId.Value != "" {
+			uploadId = fileIn.UploadId.Value
+			// Fetch parts from uploads table
+			if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+				return nil, &apiError{err: err}
+			}
+
+			// Validate parts: sum of sizes must equal file size and no partId should be 0
+			for _, upload := range uploads {
+				if upload.PartId == 0 {
+					return nil, &apiError{err: errors.New("invalid part: part_id cannot be zero"), code: 400}
+				}
+			}
+			
+			// Convert uploads to parts
+			for _, upload := range uploads {
+				parts = append(parts, api.Part{
+					ID:   upload.PartId,
+					Salt: api.NewOptString(upload.Salt),
+				})
+			}
+		}
+
+		if len(parts) > 0 {
+			fileDB.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(parts)))
+		}
+
+		// Compute BLAKE3 tree hash from block hashes if uploadId is provided
+		if uploadId != "" && len(uploads) > 0 {
+			var allBlockHashes []byte
+			for _, upload := range uploads {
+				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
+			}
+
+			if len(allBlockHashes) > 0 {
+				treeHashBytes := hash.ComputeTreeHash(allBlockHashes)
+				treeHash := hash.SumToHex(treeHashBytes)
+				fileDB.Hash = &treeHash
+			}
+		} else if fileIn.Size.Value == 0 {
+			// For zero-length files, compute hash of empty data
+			treeHashBytes := hash.ComputeTreeHash([]byte{})
+			treeHash := hash.SumToHex(treeHashBytes)
+			fileDB.Hash = &treeHash
+		}
+
+		fileDB.Size = utils.Ptr(fileIn.Size.Value)
+	}
+	fileDB.Name = fileIn.Name
+	fileDB.Type = string(fileIn.Type)
+	fileDB.UserId = userId
+	fileDB.Status = "active"
+	fileDB.Encrypted = utils.Ptr(fileIn.Encrypted.Value)
+	if fileIn.UpdatedAt.IsSet() && !fileIn.UpdatedAt.Value.IsZero() {
+		fileDB.UpdatedAt = utils.Ptr(fileIn.UpdatedAt.Value)
+	} else {
+		fileDB.UpdatedAt = utils.Ptr(time.Now().UTC())
+	}
+
+	// Use transaction to ensure file creation and upload cleanup are atomic
+	err = a.db.Transaction(func(tx *gorm.DB) error {
+		//For some reason, gorm conflict clauses are not working with partial index so using raw query
+		if err := tx.Raw(`
+			INSERT INTO teldrive.files (
+				name, parent_id, user_id, mime_type, category, parts,
+				size, type, encrypted, updated_at, channel_id, status, hash
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (name, COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), user_id)
+			WHERE status = 'active'
+			DO UPDATE SET
+				mime_type = EXCLUDED.mime_type,
+				category = EXCLUDED.category,
+				parts = EXCLUDED.parts,
+				size = EXCLUDED.size,
+				type = EXCLUDED.type,
+				encrypted = EXCLUDED.encrypted,
+				updated_at = EXCLUDED.updated_at,
+				channel_id = EXCLUDED.channel_id,
+				status = EXCLUDED.status,
+				hash = EXCLUDED.hash
+			RETURNING *
+		`,
+			fileDB.Name, fileDB.ParentId, fileDB.UserId, fileDB.MimeType,
+			fileDB.Category, fileDB.Parts, fileDB.Size, fileDB.Type,
+			fileDB.Encrypted, fileDB.UpdatedAt, fileDB.ChannelId, fileDB.Status,
+			fileDB.Hash,
+		).Scan(&fileDB).Error; err != nil {
+			return err
+		}
+
+		// Delete uploads after successful file creation
+		if uploadId != "" {
+			if err := tx.Where("upload_id = ?", uploadId).Delete(&models.Upload{}).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	if fileDB.ParentId != nil {
+		parentID = fileDB.ParentId
+	}
+
+	a.events.Record(events.OpCreate, userId, &models.Source{
+		ID:       fileDB.ID,
+		Type:     fileDB.Type,
+		Name:     fileDB.Name,
+		ParentID: *parentID,
+	})
+	return mapper.ToFileOut(fileDB), nil
+}
+
+func (a *apiService) FilesCreateShare(ctx context.Context, req *api.FileShareCreate, params api.FilesCreateShareParams) error {
+	userId := auth.GetUser(ctx)
+
+	var fileShare models.FileShare
+
+	if req.Password.Value != "" {
+		bytes, err := bcrypt.GenerateFromPassword([]byte(req.Password.Value), bcrypt.MinCost)
+		if err != nil {
+			return &apiError{err: err}
+		}
+		fileShare.Password = utils.Ptr(string(bytes))
+	}
+
+	fileShare.FileId = params.ID
+	if req.ExpiresAt.IsSet() {
+		fileShare.ExpiresAt = utils.Ptr(req.ExpiresAt.Value)
+	}
+	fileShare.UserId = userId
+
+	if err := a.db.Create(&fileShare).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	return nil
+}
+
+func (a *apiService) deleteFilesBulk(db *gorm.DB, fileIds []string, userId int64) error {
+	query := `
+	WITH RECURSIVE target_folders AS (
+		SELECT id FROM teldrive.files WHERE id IN (?) AND user_id = ?
+		UNION ALL
+		SELECT f.id FROM teldrive.files f JOIN target_folders tf ON f.parent_id = tf.id
+	),
+	mark_deleted AS (
+		UPDATE teldrive.files SET status = 'pending_deletion'
+		WHERE (parent_id IN (SELECT id FROM target_folders) OR id IN (?))
+		AND type = 'file'
+	)
+	DELETE FROM teldrive.files WHERE id IN (SELECT id FROM target_folders) AND type = 'folder';
+	`
+	return db.Exec(query, fileIds, userId, fileIds).Error
+}
+
+func (a *apiService) getFullPath(db *gorm.DB, fileID string) (string, error) {
+	var path string
+	query := `
+	WITH RECURSIVE path_tree AS (
+		SELECT id, parent_id, name, 0 as lvl FROM teldrive.files WHERE id = ?
+		UNION ALL
+		SELECT f.id, f.parent_id, f.name, pt.lvl + 1
+		FROM teldrive.files f JOIN path_tree pt ON f.id = pt.parent_id
+	)
+	SELECT string_agg(name, '/' ORDER BY lvl DESC) FROM path_tree;
+	`
+	err := db.Raw(query, fileID).Scan(&path).Error
+	if path != "" {
+		path = "/" + path
+	}
+	return strings.TrimPrefix(path, "/root"), err
+}
+
+func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error {
+	userId := auth.GetUser(ctx)
+
+	if len(req.Ids) == 0 {
+		return &apiError{err: errors.New("ids should not be empty"), code: 409}
+	}
+
+	var fileDB models.File
+
+	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
+		First(&fileDB).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	if err := a.deleteFilesBulk(a.db, req.Ids, userId); err != nil {
+		return &apiError{err: err}
+	}
+
+	keys := []string{}
+	for _, id := range req.Ids {
+		keys = append(keys, cache.KeyFile(id), cache.KeyFileMessages(id))
+	}
+	if len(keys) > 0 {
+		a.cache.Delete(ctx, keys...)
+	}
+
+	var parentID string
+	if fileDB.ParentId != nil {
+		parentID = *fileDB.ParentId
+	}
+
+	a.events.Record(events.OpDelete, userId, &models.Source{
+		ID:       fileDB.ID,
+		Type:     fileDB.Type,
+		Name:     fileDB.Name,
+		ParentID: parentID,
+	})
+
+	return nil
+}
+
+func (a *apiService) FilesDeleteShare(ctx context.Context, params api.FilesDeleteShareParams) error {
+	userId := auth.GetUser(ctx)
+
+	var deletedShare models.FileShare
+
+	if err := a.db.Clauses(clause.Returning{}).Where("file_id = ?", params.ID).Where("user_id = ?", userId).
+		Delete(&deletedShare).Error; err != nil {
+		return &apiError{err: err}
+	}
+	if deletedShare.ID != "" {
+		a.cache.Delete(ctx, cache.KeyShare(deletedShare.ID))
+	}
+
+	return nil
+}
+
+func (a *apiService) FilesEditShare(ctx context.Context, req *api.FileShareCreate, params api.FilesEditShareParams) error {
+	userId := auth.GetUser(ctx)
+
+	var fileShareUpdate models.FileShare
+
+	if req.Password.Value != "" {
+		bytes, err := bcrypt.GenerateFromPassword([]byte(req.Password.Value), bcrypt.MinCost)
+		if err != nil {
+			return &apiError{err: err}
+		}
+		fileShareUpdate.Password = utils.Ptr(string(bytes))
+	}
+	if req.ExpiresAt.IsSet() {
+		fileShareUpdate.ExpiresAt = utils.Ptr(req.ExpiresAt.Value)
+	}
+
+	if err := a.db.Model(&models.FileShare{}).Where("file_id = ?", params.ID).Where("user_id = ?", userId).
+		Updates(fileShareUpdate).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	return nil
+}
+
+func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdParams) (*api.File, error) {
+	var file models.File
+	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).First(&file).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, &apiError{err: errors.New("file not found"), code: 404}
+		}
+		return nil, &apiError{err: err}
+	}
+
+	path, err := a.getFullPath(a.db, params.ID)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	res := mapper.ToFileOut(file)
+	res.Path = api.NewOptString(path)
+	if file.ChannelId != nil {
+		res.ChannelId = api.NewOptInt64(*file.ChannelId)
+	}
+
+	return res, nil
+}
+
+func (a *apiService) FilesList(ctx context.Context, params api.FilesListParams) (*api.FileList, error) {
+	userId := auth.GetUser(ctx)
+
+	queryBuilder := &fileQueryBuilder{db: a.db}
+
+	return queryBuilder.execute(&params, userId)
+}
+
+func (a *apiService) FilesMkdir(ctx context.Context, req *api.FileMkDir) error {
+	userId := auth.GetUser(ctx)
+
+	if err := a.db.Exec("select * from teldrive.create_directories(?, ?)", userId, req.Path).Error; err != nil {
+		return &apiError{err: err}
+	}
+	return nil
+}
+
+func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
+	userId := auth.GetUser(ctx)
+
+	var destParentID *string
+
+	if !isUUID(req.DestinationParent) {
+		r, err := resolvePathID(a.db, req.DestinationParent, userId)
+		if err != nil {
+			return &apiError{err: err}
+		}
+		destParentID = r
+
+	} else {
+		destParentID = &req.DestinationParent
+	}
+
+	err := a.db.Transaction(func(tx *gorm.DB) error {
+		var srcFile models.File
+		if err := tx.Where("id = ? AND user_id = ?", req.Ids[0], userId).First(&srcFile).Error; err != nil {
+			return err
+		}
+		if len(req.Ids) == 1 && req.DestinationName.Value != "" {
+			var existing models.File
+			query := tx.Where("name = ? AND user_id = ? AND status = 'active'",
+				req.DestinationName.Value, userId)
+			if destParentID == nil {
+				query = query.Where("parent_id IS NULL")
+			} else {
+				query = query.Where("parent_id = ?", *destParentID)
+			}
+
+			if err := query.First(&existing).Error; err == nil {
+				if srcFile.Type == "folder" && existing.Type == "folder" {
+					if err := tx.Model(&models.File{}).
+						Where("parent_id = ? AND status = 'active'", existing.ID).
+						Where("name NOT IN (?)",
+							tx.Model(&models.File{}).
+								Select("name").
+								Where("parent_id = ? AND status = 'active'", srcFile.ID),
+						).
+						Update("parent_id", srcFile.ID).Error; err != nil {
+						return err
+					}
+				}
+				if err := a.deleteFilesBulk(tx, []string{existing.ID}, userId); err != nil {
+					return err
+				}
+			}
+			return tx.Model(&models.File{}).
+				Where("id = ? AND user_id = ?", req.Ids[0], userId).
+				Updates(map[string]any{
+					"parent_id": destParentID,
+					"name":      req.DestinationName.Value,
+				}).Error
+		}
+		items := pgtype.Array[string]{
+			Elements: req.Ids,
+			Valid:    true,
+			Dims:     []pgtype.ArrayDimension{{Length: int32(len(req.Ids)), LowerBound: 1}},
+		}
+		if err := a.db.Model(&models.File{}).Where("id = any(?)", items).Where("user_id = ?", userId).
+			Update("parent_id", destParentID).Error; err != nil {
+			return err
+		}
+
+		var parentID string
+		if srcFile.ParentId != nil {
+			parentID = *srcFile.ParentId
+		}
+
+		var destParentIDStr string
+		if destParentID != nil {
+			destParentIDStr = *destParentID
+		}
+
+		a.events.Record(events.OpMove, userId, &models.Source{
+			ID:           destParentIDStr,
+			Type:         srcFile.Type,
+			Name:         srcFile.Name,
+			ParentID:     parentID,
+			DestParentID: destParentIDStr,
+		})
+		return nil
+
+	})
+	if err != nil {
+		return &apiError{err: err}
+	}
+	return nil
+
+}
+
+func (a *apiService) FilesShareByid(ctx context.Context, params api.FilesShareByidParams) (*api.FileShare, error) {
+	userId := auth.GetUser(ctx)
+	var result []models.FileShare
+
+	notFoundErr := &apiError{err: errors.New("invalid share"), code: 404}
+	if err := a.db.Model(&models.FileShare{}).Where("file_id = ?", params.ID).Where("user_id = ?", userId).
+		Find(&result).Error; err != nil {
+		if database.IsRecordNotFoundErr(err) {
+			return nil, notFoundErr
+		}
+		return nil, &apiError{err: err}
+	}
+
+	if len(result) == 0 {
+		return nil, notFoundErr
+	}
+	res := &api.FileShare{
+		ID: result[0].ID,
+	}
+	if result[0].Password != nil {
+		res.Protected = true
+	}
+	if result[0].ExpiresAt != nil {
+		res.ExpiresAt = api.NewOptDateTime(*result[0].ExpiresAt)
+	}
+	return res, nil
+}
+
+func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, params api.FilesUpdateParams) (*api.File, error) {
+
+	userId := auth.GetUser(ctx)
+
+	updateDb := models.File{}
+	isContentUpdate := false
+	uploadId := ""
+	var uploads []models.Upload
+
+	if req.UploadId.IsSet() && req.UploadId.Value != "" {
+		uploadId = req.UploadId.Value
+		if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+			return nil, &apiError{err: err}
+		}
+		var totalSize int64
+		for _, u := range uploads {
+			req.Parts = append(req.Parts, api.Part{
+				ID:   u.PartId,
+				Salt: api.NewOptString(u.Salt),
+			})
+			totalSize += u.Size
+		}
+		if req.Size.Value == 0 {
+			req.Size.SetTo(totalSize)
+		}
+	}
+
+	if req.Name.IsSet() && req.Name.Value != "" {
+		updateDb.Name = req.Name.Value
+	}
+
+	if req.ParentId.IsSet() && req.ParentId.Value != "" {
+		updateDb.ParentId = utils.Ptr(req.ParentId.Value)
+	}
+
+	if req.ChannelId.IsSet() && req.ChannelId.Value != 0 {
+		updateDb.ChannelId = utils.Ptr(req.ChannelId.Value)
+	}
+
+	if req.Size.IsSet() && req.Size.Value != 0 && len(req.Parts) > 0 {
+		updateDb.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(req.Parts)))
+		updateDb.Size = utils.Ptr(req.Size.Value)
+		isContentUpdate = true
+	}
+	if req.Size.IsSet() && req.Size.Value == 0 {
+		updateDb.Size = utils.Ptr(req.Size.Value)
+		isContentUpdate = true
+	}
+
+	if req.Encrypted.IsSet() {
+		updateDb.Encrypted = utils.Ptr(req.Encrypted.Value)
+		isContentUpdate = true
+	}
+
+	// Update UpdatedAt if content changed OR if explicitly set (e.g., SetModTime)
+	if isContentUpdate || req.UpdatedAt.IsSet() {
+		if req.UpdatedAt.IsSet() && !req.UpdatedAt.Value.IsZero() {
+			updateDb.UpdatedAt = utils.Ptr(req.UpdatedAt.Value)
+		} else {
+			updateDb.UpdatedAt = utils.Ptr(time.Now().UTC())
+		}
+	}
+
+	// Use transaction for atomic update
+	var file models.File
+	err := a.db.Transaction(func(tx *gorm.DB) error {
+		// Compute BLAKE3 tree hash if uploadId provided
+		if uploadId != "" && len(uploads) > 0 {
+			var allBlockHashes []byte
+			for _, upload := range uploads {
+				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
+			}
+
+			if len(allBlockHashes) > 0 {
+				treeHashBytes := hash.ComputeTreeHash(allBlockHashes)
+				treeHash := hash.SumToHex(treeHashBytes)
+				updateDb.Hash = &treeHash
+			}
+		}
+
+		// Build update query - explicitly select UpdatedAt if it's the only change
+		query := tx.Model(&models.File{}).Where("id = ?", params.ID)
+		if req.UpdatedAt.IsSet() && !isContentUpdate {
+			// Force update of updated_at field even when only metadata changes
+			query = query.Select("updated_at")
+		}
+		if err := query.Updates(updateDb).Error; err != nil {
+			return err
+		}
+
+		// Delete uploads after successful update
+		if uploadId != "" {
+			if err := tx.Where("upload_id = ?", uploadId).Delete(&models.Upload{}).Error; err != nil {
+				return err
+			}
+		}
+
+		return tx.Where("id = ?", params.ID).First(&file).Error
+	})
+
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	keys := []string{cache.KeyFile(params.ID)}
+	if len(req.Parts) > 0 {
+		keys = append(keys, cache.KeyFileMessages(params.ID))
+		a.cache.DeletePattern(ctx, cache.KeyFileLocationPattern(params.ID))
+	}
+	a.cache.Delete(ctx, keys...)
+
+	var parentID string
+	if file.ParentId != nil {
+		parentID = *file.ParentId
+	}
+
+	a.events.Record(events.OpUpdate, userId, &models.Source{
+		ID:       file.ID,
+		Type:     file.Type,
+		Name:     file.Name,
+		ParentID: parentID,
+	})
+	return mapper.ToFileOut(file), nil
+}
+
+func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
+	ctx := r.Context()
+	logger := logging.Component("FILE").With(
+		zap.String("file_id", fileId),
+		zap.Int64("user_id", userId),
+	)
 	var (
 		session *models.Session
 		err     error
-		appErr  *types.AppError
 		user    *types.JWTClaims
 	)
+	if userId == 0 {
 
-	if sharedFile == nil {
-		authHash := c.Query("hash")
-
+		authHash := r.URL.Query().Get("hash")
 		if authHash == "" {
-			user, err = auth.VerifyUser(c, fs.db, fs.cache, fs.cnf.JWT.Secret)
+			cookie, err := r.Cookie(authCookieName)
 			if err != nil {
-				http.Error(w, "missing session or authash", http.StatusUnauthorized)
+				http.Error(w, "missing token or authash", http.StatusUnauthorized)
 				return
+			}
+			user, err = auth.VerifyUser(ctx, e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
+			if err != nil {
+				http.Error(w, "invalid token", http.StatusUnauthorized)
 			}
 			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
 			session = &models.Session{UserId: userId, Session: user.TgSession}
 		} else {
-			session, err = auth.GetSessionByHash(fs.db, fs.cache, authHash)
+			session, err = auth.GetSessionByHash(ctx, e.api.db, e.api.cache, authHash)
 			if err != nil {
 				http.Error(w, "invalid hash", http.StatusBadRequest)
 				return
 			}
 		}
-
 	} else {
-
-		session = &models.Session{UserId: sharedFile.UserID}
+		session = &models.Session{UserId: userId}
 	}
 
-	file := &schemas.FileOutFull{}
-
-	key := fmt.Sprintf("files:%s", fileID)
-
-	err = fs.cache.Get(key, file)
+	file, err := cache.Fetch(ctx, e.api.cache, cache.Key("files", fileId), 0, func() (*models.File, error) {
+		var result models.File
+		if err := e.api.db.Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
+			return nil, err
+		}
+		return &result, nil
+	})
 
 	if err != nil {
-		file, appErr = fs.GetFileByID(fileID)
-		if appErr != nil {
-			http.Error(w, appErr.Error.Error(), http.StatusBadRequest)
-			return
-		}
-		fs.cache.Set(key, file, 0)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	c.Header("Accept-Ranges", "bytes")
+	w.Header().Set("Accept-Ranges", "bytes")
 
 	var start, end int64
 
 	rangeHeader := r.Header.Get("Range")
+	contentType := defaultContentType
 
-	if file.Size == 0 {
-		c.Header("Content-Type", file.MimeType)
-		c.Header("Content-Length", "0")
+	if file.MimeType != "" {
+		contentType = file.MimeType
+	}
 
-		if rangeHeader != "" {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", file.Size))
-			http.Error(w, "Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-
-		c.Header("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": file.Name}))
+	if file.Size == nil || *file.Size == 0 {
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": file.Name}))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
+	status := http.StatusOK
 	if rangeHeader == "" {
 		start = 0
-		end = file.Size - 1
-		w.WriteHeader(http.StatusOK)
+		end = *file.Size - 1
 	} else {
-		ranges, err := http_range.Parse(rangeHeader, file.Size)
+		ranges, err := http_range.Parse(rangeHeader, *file.Size)
 		if err == http_range.ErrNoOverlap {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", file.Size))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", *file.Size))
 			http.Error(w, http_range.ErrNoOverlap.Error(), http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
@@ -795,112 +881,159 @@ func (fs *FileService) GetFileStream(c *gin.Context, download bool, sharedFile *
 		}
 		start = ranges[0].Start
 		end = ranges[0].End
-		c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.Size))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, *file.Size))
+		status = http.StatusPartialContent
 
-		w.WriteHeader(http.StatusPartialContent)
 	}
 
 	contentLength := end - start + 1
 
-	mimeType := file.MimeType
+	w.Header().Set("Content-Type", contentType)
 
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	c.Header("Content-Type", mimeType)
-
-	c.Header("Content-Length", strconv.FormatInt(contentLength, 10))
-	c.Header("E-Tag", fmt.Sprintf("\"%s\"", md5.FromString(file.Id+strconv.FormatInt(file.Size, 10))))
-	c.Header("Last-Modified", file.UpdatedAt.UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", md5.FromString(fileId+strconv.FormatInt(*file.Size, 10))))
+	w.Header().Set("Last-Modified", file.UpdatedAt.UTC().Format(http.TimeFormat))
 
 	disposition := "inline"
+
+	download := r.URL.Query().Get("download") == "1"
 
 	if download {
 		disposition = "attachment"
 	}
 
-	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": file.Name}))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": file.Name}))
 
-	tokens, err := getBotsToken(fs.db, fs.cache, session.UserId, *file.ChannelID)
+	w.WriteHeader(status)
 
-	if err != nil {
-		fs.handleError(fmt.Errorf("failed to get bots: %w", err), w)
+	if r.Method == http.MethodHead {
 		return
 	}
 
+	tokens, err := e.api.channelManager.BotTokens(ctx, session.UserId)
+
+	if err != nil {
+		logger.Error("stream.bots_fetch_failed", zap.Error(err))
+		http.Error(w, "failed to get bots", http.StatusInternalServerError)
+		return
+	}
+
+	// Limit the number of bots used for streaming if configured
+	if limit := e.api.cnf.TG.Stream.BotsLimit; limit > 0 && len(tokens) > limit {
+		tokens = tokens[:limit]
+	}
+
 	var (
-		lr           io.ReadCloser
-		client       *telegram.Client
-		multiThreads int
-		token        string
+		lr     io.ReadCloser
+		client *telegram.Client
+		token  string
 	)
 
-	multiThreads = fs.cnf.TG.Stream.MultiThreads
-
-	if fs.cnf.TG.DisableStreamBots || len(tokens) == 0 {
-		client, err = tgc.AuthClient(c, &fs.cnf.TG, session.Session)
+	if len(tokens) == 0 {
+		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, e.api.newMiddlewares(ctx, 5)...)
 		if err != nil {
-			fs.handleError(err, w)
+			logger.Error("stream.auth_client_failed", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		multiThreads = 0
 
 	} else {
-		fs.botWorker.Set(tokens, *file.ChannelID)
-
-		token, _ = fs.botWorker.Next(*file.ChannelID)
-
-		middlewares := tgc.Middlewares(&fs.cnf.TG, 5)
-		client, err = tgc.BotClient(c, fs.kv, &fs.cnf.TG, token, middlewares...)
+		token, _, err = e.api.botSelector.Next(ctx, tgc.BotOpStream, session.UserId, tokens)
 		if err != nil {
-			fs.handleError(err, w)
+			logger.Error("stream.bot_selection_failed", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.newMiddlewares(ctx, 5)...)
+		if err != nil {
+			logger.Error("stream.bot_client_failed", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	if download {
-		multiThreads = 0
+
+	botID := strconv.FormatInt(session.UserId, 10)
+	if token != "" {
+		parts := strings.Split(token, ":")
+		if len(parts) > 0 {
+			botID = parts[0]
+		}
 	}
 
-	if r.Method != "HEAD" {
+	if r.Method != http.MethodHead {
 		handleStream := func() error {
-			parts, err := getParts(c, client, fs.cache, file)
+			parts, err := getParts(ctx, client, e.api.cache, file)
 			if err != nil {
-				fs.handleError(err, w)
+				logger.Error("stream.parts_fetch_failed", zap.Error(err))
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
 			}
-			lr, err = reader.NewLinearReader(c, client.API(), fs.cache, file, parts, start, end, &fs.cnf.TG, multiThreads)
+
+			lr, err = reader.NewReader(ctx,
+				client.API(),
+				e.api.cache,
+				file,
+				parts,
+				start,
+				end,
+				&e.api.cnf.TG,
+				botID,
+			)
 
 			if err != nil {
-				fs.handleError(err, w)
+				logger.Error("stream.reader_create_failed", zap.Error(err))
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
 			}
 			if lr == nil {
-				fs.handleError(fmt.Errorf("failed to initialise reader"), w)
+				logger.Error("stream.reader_nil")
+				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
 				return nil
 			}
+
 			_, err = io.CopyN(w, lr, contentLength)
 			if err != nil {
 				lr.Close()
 			}
 			return nil
 		}
-		tgc.RunWithAuth(c, client, token, func(ctx context.Context) error {
+
+		tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
 			return handleStream()
 		})
 
 	}
 }
 
-func (fs *FileService) handleError(err error, w http.ResponseWriter) {
-	fs.logger.Error(err)
-	http.Error(w, err.Error(), http.StatusInternalServerError)
-
+func (e *extendedService) SharesStream(w http.ResponseWriter, r *http.Request, shareId, fileId string) {
+	share, err := e.api.validFileShare(r, shareId)
+	if err != nil && errors.Is(err, ErrEmptyAuth) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	e.FilesStream(w, r, fileId, share.UserId)
 }
 
-func getOrder(fquery *schemas.FileQuery) clause.OrderByColumn {
-	sortColumn := utils.CamelToSnake(fquery.Sort)
+func (a *apiService) FilesStream(ctx context.Context, params api.FilesStreamParams) (api.FilesStreamRes, error) {
+	return nil, nil
+}
 
-	return clause.OrderByColumn{Column: clause.Column{Name: sortColumn},
-		Desc: fquery.Order == "desc"}
+func (a *apiService) SharesStream(ctx context.Context, params api.SharesStreamParams) (api.SharesStreamRes, error) {
+	return nil, nil
+}
+
+func mapParts(_parts []api.Part) []api.Part {
+	return utils.Map(_parts, func(part api.Part) api.Part {
+		p := api.Part{ID: part.ID}
+		if part.Salt.Value != "" {
+			p.Salt = part.Salt
+		}
+		return p
+	})
+
 }

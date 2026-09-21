@@ -1,10 +1,7 @@
 package database
 
 import (
-	"database/sql"
 	"embed"
-	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -44,39 +41,23 @@ func NewTestDatabase(tb testing.TB, migration bool) *gorm.DB {
 	sqlDB.SetConnMaxIdleTime(10 * time.Minute)
 
 	if migration {
-		migrateDB(sqlDB)
+		MigrateDB(db)
 	}
 
 	return db
 
 }
-func DeleteRecordAll(_ testing.TB, db *gorm.DB, tableWhereClauses []string) error {
-	if len(tableWhereClauses)%2 != 0 {
-		return errors.New("must exist table and where clause")
-	}
 
-	for i := 0; i < len(tableWhereClauses)-1; i += 2 {
-		rowDB, err := db.DB()
-		if err != nil {
-			return err
-		}
-		query := fmt.Sprintf("DELETE FROM %s WHERE %s", tableWhereClauses[i], tableWhereClauses[i+1])
-		_, err = rowDB.Exec(query)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func migrateDB(db *sql.DB) error {
+func MigrateDB(db *gorm.DB) error {
+	sqlDb, _ := db.DB()
 	goose.SetBaseFS(embedMigrations)
+	goose.SetLogger(goose.NopLogger())
 
 	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("failed run migrate: %w", err)
+		return err
 	}
-	if err := goose.Up(db, "migrations"); err != nil {
-		return fmt.Errorf("failed run migrate: %w", err)
+	if err := goose.Up(sqlDb, "migrations"); err != nil {
+		return err
 	}
 	return nil
 }
