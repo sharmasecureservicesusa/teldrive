@@ -41,6 +41,12 @@ if [ ! -x ./bin/teldrive ]; then
   exit 1
 fi
 
+# Avoid starting a second instance if the port is already served.
+if curl -fsS -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; then
+  echo "teldrive already serving on http://localhost:${port}; nothing to do"
+  exit 0
+fi
+
 echo "==> Starting teldrive on http://localhost:${port}"
 exec ./bin/teldrive run \
   --db-data-source "$dsn" \
