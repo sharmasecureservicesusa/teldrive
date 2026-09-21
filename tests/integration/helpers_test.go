@@ -35,7 +35,41 @@ func createDummyUser(db *gorm.DB) error {
 		UserName:  testUserName,
 		IsPremium: false,
 	}
-	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&user).Error
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&user).Error; err != nil {
+		return err
+	}
+	// The server creates the root folder during login; tests bypass that flow.
+	return createRootFolder(db)
+}
+
+func rootFolderID(db *gorm.DB) (string, error) {
+	var root models.File
+	if err := db.Where("user_id = ? AND parent_id IS NULL", testUserID).First(&root).Error; err != nil {
+		return "", err
+	}
+	return root.ID, nil
+}
+
+func createRootFolder(db *gorm.DB) error {
+	var count int64
+	if err := db.Model(&models.File{}).
+		Where("user_id = ? AND parent_id IS NULL", testUserID).
+		Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	root := models.File{
+		Name:      "root",
+		Type:      "folder",
+		MimeType:  "drive/folder",
+		UserId:    testUserID,
+		Status:    "active",
+		UpdatedAt: &now,
+	}
+	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&root).Error
 }
 
 func createSession(db *gorm.DB) (string, error) {

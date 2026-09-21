@@ -106,7 +106,9 @@ func TestWholeFileFlow(t *testing.T) {
 	// Verify move
 	movedFile, err := service.FilesGetById(ctx, api.FilesGetByIdParams{ID: file.ID.Value})
 	require.NoError(t, err)
-	assert.False(t, movedFile.ParentId.IsSet()) // Root has no parent
+	rootID, err := rootFolderID(testDB)
+	require.NoError(t, err)
+	assert.Equal(t, rootID, movedFile.ParentId.Value)
 
 	// 7. Delete File
 	err = service.FilesDelete(ctx, &api.FileDelete{
